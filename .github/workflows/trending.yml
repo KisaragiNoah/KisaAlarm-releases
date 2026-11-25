@@ -1,0 +1,131 @@
+# KisaAlarm の「YouTube の急上昇の曲」の一覧を作る GitHub Actions。
+# 配布用の公開リポジトリ（KisaragiNoah/KisaAlarm-releases）の .github/workflows/trending.yml に置く
+# （setup-trending.ps1 を実行すれば自動で置かれる）。
+#
+#  - YouTube Data API で日本の音楽カテゴリの人気チャートを取得し、trending-data ブランチの trending.json に保存する
+#  - アプリは https://raw.githubusercontent.com/<リポジトリ>/trending-data/trending.json を読むだけ
+#  - API キーはリポジトリのシークレット YOUTUBE_API_KEY（アプリには入れない）
+#  - 更新間隔はリポジトリの変数 TRENDING_INTERVAL_MINUTES（分。未設定なら 60）。
+#    15 分ごとに起動し、前回の更新から間隔がたっていなければ何もしない（API も使わない）
+#  - Actions のタブから手動でも実行できる（間隔に関係なくすぐ更新）
+
+name: Update trending music
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trending
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch and publish
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          INTERVAL_MINUTES: ${{ vars.TRENDING_INTERVAL_MINUTES }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' }}
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${YOUTUBE_API_KEY}" ]; then
+            echo "::error::シークレット YOUTUBE_API_KEY が設定されていません"
+            exit 1
+          fi
+
+          git init -q work
+          cd work
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+          git fetch -q --depth 1 origin trending-data 2>/dev/null && git checkout -q FETCH_HEAD -- trending.json 2>/dev/null || true
+
+          python3 - <<'PY'
+          import datetime, json, os, re, sys, urllib.parse, urllib.request
+
+          now = datetime.datetime.now(datetime.timezone.utc)
+          try:
+              interval = max(15, int(os.environ.get("INTERVAL_MINUTES") or 60))
+          except ValueError:
+              interval = 60
+
+          # 前回の更新から間隔がたっていなければ何もしない（手動実行のときは必ず更新）
+          if os.environ.get("FORCE") != "true" and os.path.exists("trending.json"):
+              try:
+                  with open("trending.json", encoding="utf-8") as f:
+                      updated = datetime.datetime.fromisoformat(json.load(f)["updatedAt"].replace("Z", "+00:00"))
+                  # 起動が数分ずれても 1 回分飛ばさないよう、5 分の余裕を持たせる
+                  if now - updated < datetime.timedelta(minutes=interval - 5):
+                      print(f"前回の更新（{updated:%H:%M} UTC）から {interval} 分たっていないため、今回は更新しません")
+                      open("SKIP", "w").close()
+                      sys.exit(0)
+              except Exception as e:
+                  print(f"前回の一覧を読めませんでした（更新します）: {e}")
+
+          params = urllib.parse.urlencode({
+              "part": "snippet,contentDetails,status",
+              "chart": "mostPopular",
+              "regionCode": "JP",
+              "videoCategoryId": "10",
+              "maxResults": "50",
+              "hl": "ja",
+              "key": os.environ["YOUTUBE_API_KEY"],
+          })
+          with urllib.request.urlopen(f"https://www.googleapis.com/youtube/v3/videos?{params}", timeout=30) as r:
+              data = json.load(r)
+
+          def seconds(iso):
+              m = re.fullmatch(r"P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso or "")
+              if not m:
+                  return None
+              d, h, mi, s = (int(x or 0) for x in m.groups())
+              return ((d * 24 + h) * 60 + mi) * 60 + s
+
+          videos = []
+          for item in data.get("items", []):
+              status = item.get("status", {})
+              details = item.get("contentDetails", {})
+              if status.get("embeddable") is False:
+                  continue  # 埋め込みで再生できない
+              if details.get("contentRating", {}).get("ytRating") == "ytAgeRestricted":
+                  continue  # 年齢制限
+              restriction = details.get("regionRestriction", {})
+              if "JP" in restriction.get("blocked", []) or ("allowed" in restriction and "JP" not in restriction["allowed"]):
+                  continue  # 日本で見られない
+              length = seconds(details.get("duration"))
+              if length is not None and length < 60:
+                  continue  # ショート動画
+              snippet = item.get("snippet", {})
+              videos.append({"id": item["id"], "title": snippet.get("title", ""), "channel": snippet.get("channelTitle", "")})
+
+          if not videos:
+              print("::error::再生できる曲が 1 曲もありませんでした（前回の一覧を残します）")
+              sys.exit(1)
+
+          with open("trending.json", "w", encoding="utf-8") as f:
+              json.dump({
+                  "updatedAt": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "region": "JP",
+                  "intervalMinutes": interval,
+                  "videos": videos,
+              }, f, ensure_ascii=False, indent=1)
+          print(f"{len(videos)} 曲を保存しました。1 位: {videos[0]['title']}")
+          PY
+
+          if [ -f SKIP ]; then exit 0; fi
+
+          # 履歴を残さず、常に 1 コミットだけのブランチとして上書きする（リポジトリが大きくならない）
+          git checkout -q --orphan publish
+          git rm -rq --cached . 2>/dev/null || true
+          git add trending.json
+          git commit -qm "Update trending music"
+          git push -qf origin HEAD:trending-data
